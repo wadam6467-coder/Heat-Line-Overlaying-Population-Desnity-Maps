@@ -1,0 +1,379 @@
+import re
+import numpy as np
+import pandas as pd
+import geopandas as gpd
+import rasterio
+import matplotlib.pyplot as plt
+from shapely.geometry import LineString, Point
+from shapely.ops import substring
+from matplotlib.lines import Line2D
+import xml.etree.ElementTree as ET
+
+# =============================================================================
+# 1) PLOT STYLE SETTINGS
+#    Controls font sizes so the final figure is readable in a dissertation.
+# =============================================================================
+TITLE_FS   = 18
+AXIS_FS    = 16
+TICK_FS    = 14
+CBAR_FS    = 16
+LEGEND_FS  = 13
+LEGEND_TFS = 14
+
+NODE_FS    = 16
+EDGE_FS    = 15
+
+
+# =============================================================================
+# 2) USER INPUT FILES
+#    - POP_RASTER: background population density raster
+#    - OLD_RAIL_KML / NEW_RAIL_KML: existing and proposed rail alignments
+#    - STATIONS_KML: station point locations
+#    - RESULTS_FILE: Excel table containing marginal component failure P(X=0)
+# =============================================================================
+POP_RASTER   = r"C:\Users\aw432\OneDrive\Documents\Finaly year of uni\Dissertation\Maps\log10pop.tif"
+
+OLD_RAIL_KML = r"C:\Users\aw432\OneDrive\Documents\Finaly year of uni\Dissertation\Maps\TCE, Toamasina to Moramanga.kml"
+NEW_RAIL_KML = r"C:\Users\aw432\OneDrive\Documents\Finaly year of uni\Dissertation\Maps\New Suggested Line Path.kml"
+
+STATIONS_KML = r"C:\Users\aw432\OneDrive\Documents\Finaly year of uni\Dissertation\Maps\Station list 2.kml"
+
+RESULTS_FILE = r"C:\Users\aw432\OneDrive\Documents\Finaly year of uni\Dissertation\Coding\BRC NEW.xlsx"
+
+OUTPUT_OLD_SEGMENTS = r"C:\Users\aw432\OneDrive\Documents\Finaly year of uni\Dissertation\Coding\Results\old_route_BRC_segments.geojson"
+OUTPUT_NEW_SEGMENTS = r"C:\Users\aw432\OneDrive\Documents\Finaly year of uni\Dissertation\Coding\Results\new_route_BRC_segments.geojson"
+
+
+# =============================================================================
+# 3) SEGMENTS TO PLOT
+#    Only these station-to-station sections are extracted and coloured.
+# =============================================================================
+SEGMENTS_WANTED = [
+    ("Toamasina", "Brickaville"),
+    ("Brickaville", "Moramanga"),
+    ("Moramanga", "Antananarivo"),
+]
+
+NEW_ROUTE_STATION_FILTER = ["Antananarivo", "Moramanga", "Brickaville", "Toamasina"]
+
+MAX_SNAP_DIST_DEG = 0.05
+
+POP_LOG10_MIN = 0.001634
+POP_LOG10_MAX = 3.097382
+
+
+# =============================================================================
+# 4) NETWORK LABELS (FOR FIGURE ANNOTATION)
+#    n_1..n_4 label stations; e_1..e_6 label links (old vs new routes).
+# =============================================================================
+NODE_LABELS = {
+    "toamasina": r"$n_1$",
+    "brickaville": r"$n_2$",
+    "moramanga": r"$n_3$",
+    "antananarivo": r"$n_4$",
+}
+
+OLD_EDGE_LABELS = [r"$e_1$", r"$e_3$", r"$e_5$"]
+NEW_EDGE_LABELS = [r"$e_2$", r"$e_4$", r"$e_6$"]
+
+
+# =============================================================================
+# 5) KML PARSING
+#    Reads:
+#    - LineString geometry for the rail alignment
+#    - Point geometries for station locations
+# =============================================================================
+def _parse_kml_coords(text: str):
+    if not text:
+        return []
+    text = text.strip().replace("\n", " ")
+    coords = []
+    for token in text.split():
+        parts = token.split(",")
+        if len(parts) >= 2:
+            coords.append((float(parts[0]), float(parts[1])))  # (lon, lat)
+    return coords
+
+def load_kml_linestring(path: str) -> LineString:
+    tree = ET.parse(path)
+    root = tree.getroot()
+
+    lines = []
+    for coord_el in root.findall(".//{*}LineString/{*}coordinates"):
+        coords = _parse_kml_coords(coord_el.text)
+        if len(coords) >= 2:
+            lines.append(LineString(coords))
+
+    if not lines:
+        raise ValueError(f"No LineString geometries found in KML: {path}")
+
+    stitched = []
+    for ls in lines:
+        stitched.extend(list(ls.coords))
+
+    cleaned = [stitched[0]]
+    for xy in stitched[1:]:
+        if xy != cleaned[-1]:
+            cleaned.append(xy)
+
+    return LineString(cleaned)
+
+def load_kml_points(path: str) -> gpd.GeoDataFrame:
+    tree = ET.parse(path)
+    root = tree.getroot()
+
+    names, geoms = [], []
+    for pm in root.findall(".//{*}Placemark"):
+        name_el = pm.find(".//{*}name")
+        name = name_el.text.strip() if (name_el is not None and name_el.text) else "unknown"
+
+        coord_el = pm.find(".//{*}Point/{*}coordinates")
+        if coord_el is None or not coord_el.text:
+            continue
+
+        coords = _parse_kml_coords(coord_el.text)
+        if len(coords) != 1:
+            continue
+
+        lon, lat = coords[0]
+        names.append(name)
+        geoms.append(Point(lon, lat))
+
+    if not geoms:
+        raise ValueError(f"No Point Placemarks found in KML: {path}")
+
+    return gpd.GeoDataFrame({"name": names}, geometry=geoms, crs="EPSG:4326")
+
+
+# =============================================================================
+# 6) READ RESULTS TABLE + MATCH SEGMENT NAMES
+#    Loads the BRC Excel file, then standardises the segment labels so they
+#    match the "A to B" naming used in the GIS segments.
+# =============================================================================
+def read_results_table_xlsx(path: str) -> pd.DataFrame:
+    return pd.read_excel(path, sheet_name=0)
+
+def find_required_column_exact(df: pd.DataFrame, required_name: str) -> str:
+    if required_name in df.columns:
+        return required_name
+    print("\nAvailable columns:\n", list(df.columns))
+    raise ValueError(f"Missing required column EXACTLY named: '{required_name}'")
+
+def find_segment_name_column(df: pd.DataFrame) -> str:
+    required = "Route Segment"
+    if required not in df.columns:
+        print("\nAvailable columns:\n", list(df.columns))
+        raise ValueError(f"Couldn't find required segment column exactly named: '{required}'")
+    return required
+
+def norm_seg_label(s: str) -> str:
+    s = str(s).strip().lower()
+    s = re.sub(r"\s*->\s*", " to ", s)
+    s = s.replace("–", "-").replace("—", "-")
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+def wanted_labels():
+    out = []
+    for a, b in SEGMENTS_WANTED:
+        out.append(norm_seg_label(f"{a} to {b}"))
+        out.append(norm_seg_label(f"{a} -> {b}"))
+        out.append(norm_seg_label(f"{a}-{b}"))
+    return set(out)
+
+
+# =============================================================================
+# 7) BUILD GIS SEGMENTS BETWEEN STATIONS
+#    Converts the full rail line into only the requested station-to-station
+#    segments using geometric projection + substring extraction.
+# =============================================================================
+def station_dict_by_name(stations_gdf: gpd.GeoDataFrame):
+    return {str(r["name"]).strip().lower(): r.geometry for _, r in stations_gdf.iterrows()}
+
+def build_segment_between_stations(line: LineString, p1: Point, p2: Point):
+    d1 = line.project(p1)
+    d2 = line.project(p2)
+    return substring(line, min(d1, d2), max(d1, d2))
+
+def make_specific_segments(line: LineString, stations_gdf: gpd.GeoDataFrame, pairs):
+    sd = station_dict_by_name(stations_gdf)
+    seg_geoms, seg_names = [], []
+    for a, b in pairs:
+        a_key, b_key = a.strip().lower(), b.strip().lower()
+        if a_key not in sd or b_key not in sd:
+            raise ValueError(f"Could not find stations '{a}' or '{b}' in stations KML.")
+        seg_geoms.append(build_segment_between_stations(line, sd[a_key], sd[b_key]))
+        seg_names.append(f"{a} to {b}")
+    return gpd.GeoDataFrame({"segment_name": seg_names}, geometry=seg_geoms, crs=stations_gdf.crs)
+
+
+# =============================================================================
+# 8) MAP MARGINAL COMPONENT FAILURE P(X=0) TO COLOUR BINS
+#    This converts each segment's marginal failure probability into a colour.
+#    (This is NOT the system/network probability — it is component-level only.)
+# =============================================================================
+def prob_to_color(p):
+    if p is None or (isinstance(p, float) and np.isnan(p)):
+        return "grey"
+    p = float(p)
+    if p >= 0.7: return "maroon"
+    if p >= 0.6: return "red"
+    if p >= 0.5: return "orange"
+    if p >= 0.4: return "yellow"
+    if p >= 0.3: return "green"
+    if p >= 0.2: return "blue"
+    if p >= 0.1: return "navy"
+    return "grey"
+
+
+# =============================================================================
+# 9) LABEL PLACEMENT HELPERS
+#    Used to place n_i and e_i labels clearly on the map.
+# =============================================================================
+def midpoint_of_linestring(ls: LineString) -> Point:
+    try:
+        return ls.interpolate(0.5, normalized=True)
+    except TypeError:
+        return ls.interpolate(ls.length * 0.5)
+
+def draw_label(ax, x, y, text, fs, dx=3, dy=3, z=10):
+    ax.annotate(
+        text, xy=(x, y), xytext=(dx, dy), textcoords="offset points",
+        fontsize=fs, fontweight="bold", ha="left", va="bottom", zorder=z,
+        bbox=dict(facecolor="white", edgecolor="none", alpha=0.7, pad=1.5),
+    )
+
+
+# =============================================================================
+# 10) MAIN WORKFLOW
+#    1) Load rail lines + stations from KML
+#    2) Build only the requested segments
+#    3) Read marginal P(X=0) from Excel for old/new routes
+#    4) Plot population raster + coloured segments + labels
+#    5) Export GeoJSON for use in QGIS
+# =============================================================================
+old_line = load_kml_linestring(OLD_RAIL_KML)
+new_line = load_kml_linestring(NEW_RAIL_KML)
+stations = load_kml_points(STATIONS_KML)
+
+old_segments = make_specific_segments(old_line, stations, SEGMENTS_WANTED)
+new_segments = make_specific_segments(new_line, stations, SEGMENTS_WANTED)
+
+results_df = read_results_table_xlsx(RESULTS_FILE)
+OLD_COL = find_required_column_exact(results_df, "Existing Route P(X=0)")
+NEW_COL = find_required_column_exact(results_df, "New Route P(X=0)")
+SEG_LABEL_COL = find_segment_name_column(results_df)
+
+results_df["_seg_norm"] = results_df[SEG_LABEL_COL].apply(norm_seg_label)
+wanted = wanted_labels()
+results_4 = results_df[results_df["_seg_norm"].isin(wanted)].copy()
+
+if results_4.shape[0] == 0:
+    print("No matching segment rows found.")
+    print("Example labels in your file:", results_df[SEG_LABEL_COL].dropna().astype(str).head(20).tolist())
+    raise ValueError("Your BRC file segment names don't match the expected 'A to B' style.")
+
+results_4 = results_4.drop_duplicates(subset="_seg_norm", keep="first")
+
+old_map = dict(zip(results_4["_seg_norm"], results_4[OLD_COL]))
+new_map = dict(zip(results_4["_seg_norm"], results_4[NEW_COL]))
+
+old_segments["_seg_norm"] = old_segments["segment_name"].apply(norm_seg_label)
+new_segments["_seg_norm"] = new_segments["segment_name"].apply(norm_seg_label)
+
+old_segments["P(X=0)"] = pd.to_numeric(old_segments["_seg_norm"].map(old_map), errors="coerce").clip(0, 1)
+new_segments["P(X=0)"] = pd.to_numeric(new_segments["_seg_norm"].map(new_map), errors="coerce").clip(0, 1)
+
+old_segments["color"] = old_segments["P(X=0)"].apply(prob_to_color)
+new_segments["color"] = new_segments["P(X=0)"].apply(prob_to_color)
+
+fig, ax = plt.subplots(figsize=(12, 6))
+
+with rasterio.open(POP_RASTER) as src:
+    data = src.read(1, masked=True)
+
+    ax.imshow(
+        data,
+        extent=(src.bounds.left, src.bounds.right, src.bounds.bottom, src.bounds.top),
+        origin="upper",
+        cmap="viridis",
+        vmin=POP_LOG10_MIN,
+        vmax=POP_LOG10_MAX,
+        zorder=1
+    )
+
+    cbar = fig.colorbar(ax.images[0], ax=ax, fraction=0.046, pad=0.04)
+    cbar.set_label("Population density (people per km², log₁₀)", fontsize=CBAR_FS)
+    cbar.set_ticks([0, 1, 2, 3])
+    cbar.set_ticklabels([r"$10^0$", r"$10^1$", r"$10^2$", r"$10^3$"])
+    cbar.ax.tick_params(labelsize=TICK_FS)
+
+    if src.crs:
+        old_plot = old_segments.to_crs(src.crs)
+        new_plot = new_segments.to_crs(src.crs)
+        stations_plot = stations.to_crs(src.crs)
+    else:
+        old_plot, new_plot, stations_plot = old_segments, new_segments, stations
+
+for idx, row in enumerate(old_plot.itertuples(index=False)):
+    geom = row.geometry
+    x, y = geom.xy
+    ax.plot(x, y, linewidth=5, color=getattr(row, "color"), linestyle="-", solid_capstyle="round", zorder=3)
+    mid = midpoint_of_linestring(geom)
+    draw_label(ax, mid.x, mid.y, OLD_EDGE_LABELS[idx], EDGE_FS, dx=3, dy=3, z=8)
+
+for idx, row in enumerate(new_plot.itertuples(index=False)):
+    geom = row.geometry
+    x, y = geom.xy
+    ax.plot(x, y, linewidth=5, color=getattr(row, "color"), linestyle="--", solid_capstyle="round", zorder=4)
+    mid = midpoint_of_linestring(geom)
+    draw_label(ax, mid.x, mid.y, NEW_EDGE_LABELS[idx], EDGE_FS, dx=3, dy=-14, z=9)
+
+sd_plot = station_dict_by_name(stations_plot)
+for st_name in ["Toamasina", "Brickaville", "Moramanga", "Antananarivo"]:
+    key = st_name.strip().lower()
+    if key not in sd_plot:
+        raise ValueError(f"Could not find station '{st_name}' in stations KML.")
+    pt = sd_plot[key]
+    ax.scatter(pt.x, pt.y, s=40, color="black", zorder=6)
+    draw_label(ax, pt.x, pt.y, NODE_LABELS[key], NODE_FS, dx=6, dy=6, z=11)
+
+ax.set_xlabel("Longitude", fontsize=AXIS_FS)
+ax.set_ylabel("Latitude", fontsize=AXIS_FS)
+ax.tick_params(axis="both", which="major", labelsize=TICK_FS)
+
+prob_handles = [
+    Line2D([0], [0], color="Maroon", lw=4, label="P(failure) ≥ 0.7"),
+    Line2D([0], [0], color="red",    lw=4, label="0.6 ≤ P(failure) < 0.7"),
+    Line2D([0], [0], color="orange", lw=4, label="0.5 ≤ P(failure) < 0.6"),
+    Line2D([0], [0], color="yellow", lw=4, label="0.4 ≤ P(failure) < 0.5"),
+    Line2D([0], [0], color="green",  lw=4, label="0.3 ≤ P(failure) < 0.4"),
+    Line2D([0], [0], color="blue",   lw=4, label="0.2 ≤ P(failure) < 0.3"),
+    Line2D([0], [0], color="navy",   lw=4, label="0.1 ≤ P(failure) < 0.2"),
+]
+
+leg1 = ax.legend(
+    handles=prob_handles,
+    title="Marginal component failure probability (P(X=0))",
+    loc="upper left",
+    frameon=True,
+    fontsize=LEGEND_FS,
+    title_fontsize=LEGEND_TFS
+)
+ax.add_artist(leg1)
+
+route_handles = [
+    Line2D([0], [0], color="black", lw=4, linestyle="-",  label="Existing route"),
+    Line2D([0], [0], color="black", lw=4, linestyle="--", label="New suggested route"),
+]
+ax.legend(handles=route_handles, title="Route", loc="lower right",
+          frameon=True, fontsize=LEGEND_FS, title_fontsize=LEGEND_TFS)
+
+plt.tight_layout()
+plt.show()
+
+old_segments.drop(columns=["_seg_norm"], errors="ignore").to_file(OUTPUT_OLD_SEGMENTS, driver="GeoJSON")
+new_segments.drop(columns=["_seg_norm"], errors="ignore").to_file(OUTPUT_NEW_SEGMENTS, driver="GeoJSON")
+print("Saved old segments to:", OUTPUT_OLD_SEGMENTS)
+print("Saved new segments to:", OUTPUT_NEW_SEGMENTS)
+

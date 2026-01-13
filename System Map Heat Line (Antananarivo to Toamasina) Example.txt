@@ -1,0 +1,177 @@
+import geopandas as gpd
+import pandas as pd
+import rasterio
+from rasterio.plot import show as rioshow
+from shapely.geometry import LineString, Point
+import matplotlib.pyplot as plt
+import numpy as np
+from shapely.ops import substring
+from matplotlib.lines import Line2D
+
+
+# =============================================================================
+# 0) USER INPUTS
+#    File paths and key parameters used throughout the script.
+# =============================================================================
+
+# Background raster showing population density (log10 scale)
+POP_RASTER = r"...\log10pop.tif"
+
+# Railway alignment and station locations
+RAIL_KML     = r"...\TCE, Toamasina to Moramanga.kml"
+STATIONS_KML = r"...\Station list.kml"
+
+# Excel file containing marginal failure probabilities from the BN
+RESULTS_EXCEL = r"...\Results of sys.xlsx"
+
+# Output GeoJSON for use in QGIS
+OUTPUT_SEGMENTS = r"...\rail_segments_with_probs.geojson"
+
+# Column names in the Excel file
+SEG_ID_COL    = "System 2"     # segment identifier
+FAIL_PROB_COL = "Failure 2"    # marginal failure probability P(X=0)
+
+# Optional buffer width for population sampling
+SAMPLE_BUFFER = 0.001
+
+# Known min/max of the population raster (for plotting)
+POP_LOG10_MIN = 0.001634
+POP_LOG10_MAX = 3.097382
+
+
+# =============================================================================
+# 1) LOAD SPATIAL DATA
+#    Reads the railway alignment and station points from KML files.
+# =============================================================================
+
+rail_gdf = gpd.read_file(RAIL_KML, driver="KML").to_crs("EPSG:4326")
+
+# Combine all rail geometries into a single LineString
+geom = rail_gdf.geometry.unary_union
+if geom.geom_type == "MultiLineString":
+    coords = []
+    for part in geom.geoms:
+        coords.extend(list(part.coords))
+    rail_line = LineString(coords)
+elif geom.geom_type == "LineString":
+    rail_line = geom
+else:
+    raise ValueError("Unexpected railway geometry type")
+
+stations_gdf = gpd.read_file(STATIONS_KML, driver="KML").to_crs(rail_gdf.crs)
+
+# Project stations onto the railway to order them correctly
+stations_gdf["dist_along"] = stations_gdf.geometry.apply(
+    lambda p: rail_line.project(p)
+)
+stations_gdf = stations_gdf.sort_values("dist_along").reset_index(drop=True)
+
+
+# =============================================================================
+# 2) SPLIT THE RAILWAY INTO SEGMENTS BETWEEN STATIONS
+#    Each segment becomes a separate component.
+# =============================================================================
+
+segment_geoms = []
+segment_ids   = []
+
+for i in range(len(stations_gdf) - 1):
+    start_d = stations_gdf.loc[i, "dist_along"]
+    end_d   = stations_gdf.loc[i+1, "dist_along"]
+
+    segment_geoms.append(substring(rail_line, start_d, end_d))
+    segment_ids.append(f"seg_{i+1:03d}")
+
+segments_gdf = gpd.GeoDataFrame(
+    {"segment_id": segment_ids},
+    geometry=segment_geoms,
+    crs=rail_gdf.crs
+)
+
+
+# =============================================================================
+# 3) JOIN MARGINAL FAILURE PROBABILITIES
+#    Attaches P(X=0) values from the BN results to each segment.
+# =============================================================================
+
+results_df = pd.read_excel(RESULTS_EXCEL)
+
+segments_gdf = segments_gdf.merge(
+    results_df[[SEG_ID_COL, FAIL_PROB_COL]],
+    left_on="segment_id",
+    right_on=SEG_ID_COL,
+    how="left"
+)
+
+
+# =============================================================================
+# 4) OPTIONAL: POPULATION SAMPLING PER SEGMENT
+#    Computes mean population density near each segment (optional).
+# =============================================================================
+
+def mean_pop_for_segment(line, raster_path, buffer_width):
+    import rasterio.mask
+    with rasterio.open(raster_path) as src:
+        geom = line.buffer(buffer_width)
+        if src.crs and src.crs != segments_gdf.crs:
+            geom = gpd.GeoSeries([geom], crs=segments_gdf.crs).to_crs(src.crs).iloc[0]
+
+        out_image, _ = rasterio.mask.mask(
+            src, [geom.__geo_interface__], crop=True, filled=False
+        )
+        data = out_image[0]
+        data = data[np.isfinite(data)]
+        return np.nan if data.size == 0 else float(data.mean())
+
+
+# =============================================================================
+# 5) VISUALISATION
+#    Plots marginal component failure probabilities over population density.
+# =============================================================================
+
+segments_gdf["P(X=0)"] = segments_gdf[FAIL_PROB_COL].astype(float).clip(0, 1)
+
+def prob_to_color(p):
+    if np.isnan(p): return "grey"
+    if p >= 0.99:   return "maroon"
+    if p >= 0.9:    return "red"
+    if p >= 0.8:    return "orange"
+    if p >= 0.4:    return "yellow"
+    if p >= 0.3:    return "green"
+    if p >= 0.1:    return "blue"
+    return "navy"
+
+segments_gdf["color"] = segments_gdf["P(X=0)"].apply(prob_to_color)
+
+fig, ax = plt.subplots(figsize=(12, 6))
+
+with rasterio.open(POP_RASTER) as src:
+    data = src.read(1, masked=True)
+    img = ax.imshow(
+        data,
+        extent=(src.bounds.left, src.bounds.right, src.bounds.bottom, src.bounds.top),
+        origin="upper",
+        cmap="viridis",
+        vmin=POP_LOG10_MIN,
+        vmax=POP_LOG10_MAX,
+        zorder=1
+    )
+    cbar = fig.colorbar(img, ax=ax)
+    cbar.set_label("Population density (people per km², log₁₀)")
+
+for _, row in segments_gdf.iterrows():
+    x, y = row.geometry.xy
+    ax.plot(x, y, linewidth=4, color=row["color"], zorder=3)
+
+ax.set_xlabel("Longitude")
+ax.set_ylabel("Latitude")
+plt.tight_layout()
+plt.show()
+
+
+# =============================================================================
+# 6) SAVE OUTPUT
+#    Exports segment geometries with marginal probabilities for QGIS.
+# =============================================================================
+segments_gdf.to_file(OUTPUT_SEGMENTS, driver="GeoJSON")
+print("Saved segments to:", OUTPUT_SEGMENTS)
