@@ -1,0 +1,169 @@
+from __future__ import annotations
+
+import os
+import numpy as np
+import pandas as pd
+import geopandas as gpd
+import rasterio
+from rasterio.warp import calculate_default_transform, reproject, Resampling
+from rasterio.features import geometry_mask
+from pyproj import CRS
+
+# ============================================================
+# USER INPUTS
+# ============================================================
+POP_TIF = r"C:\Users\aw432\OneDrive\Documents\Finaly year of uni\Dissertation\Coding\Clipped Population Density.tif"
+STATIONS_KML = r"C:\Users\aw432\OneDrive\Documents\Finaly year of uni\Dissertation\Maps\Station list.kml"
+OUT_XLSX = r"C:\Users\aw432\OneDrive\Documents\Finaly year of uni\Dissertation\Coding\station_population_within_5km.xlsx"
+
+RADIUS_M = 1_000  # ✅ 1 km radius
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def pick_utm_crs_for_gdf(gdf_wgs84: gpd.GeoDataFrame) -> CRS:
+    """Pick a sensible UTM CRS for buffering in metres, based on centroid lon/lat."""
+    centroid = gdf_wgs84.geometry.unary_union.centroid
+    lon, lat = float(centroid.x), float(centroid.y)
+    zone = int((lon + 180) // 6) + 1
+    epsg = 32600 + zone if lat >= 0 else 32700 + zone
+    return CRS.from_epsg(epsg)
+
+def reproject_raster_to_crs(src, dst_crs: CRS):
+    """
+    Reproject raster to dst_crs into an in-memory numpy array + new transform.
+    Nearest resampling: safe for counts; acceptable for density too.
+    """
+    transform, width, height = calculate_default_transform(
+        src.crs, dst_crs, src.width, src.height, *src.bounds
+    )
+
+    nodata = src.nodata if src.nodata is not None else -9999
+    dst = np.full((height, width), nodata, dtype=np.float32)
+
+    reproject(
+        source=rasterio.band(src, 1),
+        destination=dst,
+        src_transform=src.transform,
+        src_crs=src.crs,
+        dst_transform=transform,
+        dst_crs=dst_crs,
+        resampling=Resampling.nearest,
+        src_nodata=src.nodata,
+        dst_nodata=nodata
+    )
+
+    return dst, transform, nodata
+
+def values_within_geom(raster_arr, raster_transform, geom, nodata):
+    """Return raster values within a geometry + pixel count used."""
+    mask = geometry_mask(
+        [geom],
+        transform=raster_transform,
+        invert=True,
+        out_shape=raster_arr.shape,
+        all_touched=False
+    )
+    vals = raster_arr[mask]
+    if nodata is not None:
+        vals = vals[vals != nodata]
+    vals = vals[np.isfinite(vals)]
+    return vals, int(mask.sum())
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+    stations = gpd.read_file(STATIONS_KML)
+    if stations.empty:
+        raise RuntimeError("No station features found in the KML.")
+
+    # Keep points only, explode multipoints
+    stations = stations[stations.geometry.geom_type.isin(["Point", "MultiPoint"])].copy()
+    stations = stations.explode(index_parts=False).reset_index(drop=True)
+
+    # Station name fallback
+    name_col = None
+    for c in ["Name", "name", "Station", "station", "Title", "title"]:
+        if c in stations.columns:
+            name_col = c
+            break
+    if name_col is None:
+        stations["station_name"] = [f"station_{i+1:03d}" for i in range(len(stations))]
+        name_col = "station_name"
+
+    if stations.crs is None:
+        stations = stations.set_crs(epsg=4326)
+
+    stations_wgs84 = stations.to_crs(epsg=4326)
+    utm_crs = pick_utm_crs_for_gdf(stations_wgs84)
+
+    # Buffer in metres
+    stations_utm = stations_wgs84.to_crs(utm_crs)
+    buffers_utm = stations_utm.copy()
+    buffers_utm["geometry"] = buffers_utm.geometry.buffer(RADIUS_M)
+
+    with rasterio.open(POP_TIF) as src:
+        if src.crs is None:
+            raise RuntimeError("Population raster has no CRS.")
+
+        # Reproject raster to UTM (so pixels are in metres)
+        raster_utm, raster_transform, nodata = reproject_raster_to_crs(src, utm_crs)
+
+        # Pixel area in km² (UTM metres -> km²)
+        px_w = float(raster_transform.a)
+        px_h = abs(float(raster_transform.e))
+        pixel_area_km2 = (px_w * px_h) / 1e6
+
+        rows = []
+        for i in range(len(buffers_utm)):
+            st_name = str(stations_wgs84.iloc[i][name_col])
+            geom = buffers_utm.iloc[i].geometry
+
+            vals, n_pix = values_within_geom(raster_utm, raster_transform, geom, nodata)
+
+            if vals.size == 0:
+                total_pixel = np.nan
+                total_km2 = np.nan
+                mean_val = np.nan
+                max_val = np.nan
+            else:
+                # Interpretation A: raster values already represent people per pixel
+                total_pixel = float(vals.sum())
+
+                # Interpretation B: raster values represent people per km² (density)
+                total_km2 = float((vals * pixel_area_km2).sum())
+
+                mean_val = float(vals.mean())
+                max_val = float(vals.max())
+
+            lon, lat = float(stations_wgs84.iloc[i].geometry.x), float(stations_wgs84.iloc[i].geometry.y)
+            area_km2 = float(geom.area) / 1e6  # UTM m² -> km²
+
+            rows.append({
+                "station_name": st_name,
+                "longitude": lon,
+                "latitude": lat,
+                "radius_km": RADIUS_M / 5000,
+                "buffer_area_km2": area_km2,
+                "n_pixels_used": n_pix,
+                "mean_raster_value_in_buffer": mean_val,
+                "max_raster_value_in_buffer": max_val,
+                "total_if_people_per_pixel": total_pixel,
+                "total_if_people_per_km2": total_km2,
+            })
+
+    df = pd.DataFrame(rows)
+
+    os.makedirs(os.path.dirname(OUT_XLSX), exist_ok=True)
+    with pd.ExcelWriter(OUT_XLSX, engine="openpyxl") as writer:
+        df.to_excel(writer, sheet_name="5km_totals", index=False)
+
+    print(f"Saved: {OUT_XLSX}")
+    print(df.head(10).to_string(index=False))
+
+
+if __name__ == "__main__":
+    main()
